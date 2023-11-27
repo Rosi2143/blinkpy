@@ -7,11 +7,10 @@ import datetime
 from json import dumps
 import traceback
 import aiohttp
-from aiofiles import open
 from requests.compat import urljoin
 from blinkpy import api
 from blinkpy.helpers.constants import TIMEOUT_MEDIA
-from blinkpy.helpers.util import to_alphanumeric
+from blinkpy.helpers.util import to_alphanumeric, json_dumps
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -39,7 +38,7 @@ class BlinkCamera:
         self.motion_detected = None
         self.wifi_strength = None
         self.last_record = None
-        self._cached_image = None
+        self._cached_thumbnail = None
         self._cached_video = None
         self.camera_type = ""
         self.product_type = None
@@ -83,10 +82,10 @@ class BlinkCamera:
             return None
 
     @property
-    def image_from_cache(self):
+    def thumbnail_from_cache(self):
         """Return the most recently cached image."""
-        if self._cached_image:
-            return self._cached_image
+        if self._cached_thumbnail:
+            return self._cached_thumbnail
         return None
 
     @property
@@ -137,11 +136,15 @@ class BlinkCamera:
 
     async def async_set_night_vision(self, value):
         """Set camera night_vision status."""
+        data = {}
         if value not in ["on", "off", "auto"]:
             return None
         if self.product_type == "catalina":
             value = {"off": 0, "on": 1, "auto": 2}.get(value, None)
-        data = dumps({"illuminator_enable": value})
+        else:
+            data["illuminator_enable_v2"] = value
+        data["illuminator_enable"] = value
+        data = dumps(data)
         res = await api.request_update_config(
             self.sync.blink,
             self.network_id,
@@ -226,6 +229,7 @@ class BlinkCamera:
 
     def extract_config_info(self, config):
         """Extract info from config."""
+        _LOGGER.debug(f"extract config info = {json_dumps(config)}")
         self.name = config.get("name", "unknown")
         self.camera_id = str(config.get("id", "unknown"))
         self.network_id = str(config.get("network_id", "unknown"))
@@ -335,7 +339,7 @@ class BlinkCamera:
 
         # If the thumbnail or clip have changed, update the cache
         update_cached_image = False
-        if new_thumbnail != self.thumbnail or self._cached_image is None:
+        if new_thumbnail != self.thumbnail or self._cached_thumbnail is None:
             update_cached_image = True
         self.thumbnail = new_thumbnail
 
@@ -346,7 +350,7 @@ class BlinkCamera:
         if new_thumbnail is not None and (update_cached_image or force_cache):
             response = await self.get_media()
             if response and response.status == 200:
-                self._cached_image = await response.read()
+                self._cached_thumbnail = await response.read()
 
         if clip_addr is not None and (update_cached_video or force_cache):
             response = await self.get_media(media_type="video")
@@ -380,6 +384,19 @@ class BlinkCamera:
                 if "local_storage" in url:
                     await api.http_post(self.sync.blink, url)
 
+    def store_thumbnail(self, path):
+        """
+        Write cached thumbnail to file.
+
+        :param path: Path to write file
+        """
+        _LOGGER.debug("Writing thumbnail from %s to %s", self.name, path)
+        if self.thumbnail_from_cache is not None:
+            with open(path, "wb") as imagefile:
+                imagefile.write(self.thumbnail_from_cache)
+        else:
+            _LOGGER.error("no cached thumbnail for %s", self.name)
+
     async def get_liveview(self):
         """Get liveview rtsps link."""
         response = await api.request_camera_liveview(
@@ -396,7 +413,7 @@ class BlinkCamera:
         _LOGGER.debug("Writing image from %s to %s", self.name, path)
         response = await self.get_media()
         if response and response.status == 200:
-            async with open(path, "wb") as imagefile:
+            async with aiofiles.open(path, "wb") as imagefile:
                 await imagefile.write(await response.read())
         else:
             _LOGGER.error("Cannot write image to file, response %s", response.status)
@@ -412,7 +429,7 @@ class BlinkCamera:
         if response is None:
             _LOGGER.error("No saved video exists for %s.", self.name)
             return
-        async with open(path, "wb") as vidfile:
+        async with aiofiles.open(path, "wb") as vidfile:
             await vidfile.write(await response.read())
 
     async def save_recent_clips(
@@ -440,7 +457,7 @@ class BlinkCamera:
             _LOGGER.debug("Saving %s to %s", clip_addr, path)
             media = await self.get_video_clip(clip_addr)
             if media and media.status == 200:
-                async with open(path, "wb") as clip_file:
+                async with aiofiles.open(path, "wb") as clip_file:
                     await clip_file.write(await media.read())
                 num_saved += 1
                 try:
